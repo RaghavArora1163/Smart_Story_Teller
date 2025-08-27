@@ -37,7 +37,7 @@ A full-stack AI-powered application that transforms text prompts into interactiv
 
 #### 1. Story Input Interface
 ![Input Interface](assets/input-interface.png)
-*Clean, dark-themed interface showing prompt input field with "Ramayana Detailed Story" example*
+*Clean, dark-themed interface showing prompt input field *
 
 **Features Shown:**
 - Clean, dark-themed interface with prominent prompt input field
@@ -50,8 +50,8 @@ A full-stack AI-powered application that transforms text prompts into interactiv
 *Live progress tracking showing "36% - Slide 2/6: audio" with detailed status updates*
 
 **Features Demonstrated:**
-- Live progress bar with percentage completion (36%)
-- Detailed status messages: "Slide 2/6: audio"
+- Live progress bar with percentage completion (43%)
+- Detailed status messages: "Slide 3/6: images"
 - Non-blocking UI allowing users to see generation progress
 - Professional progress card with bordered design and blue accent
 
