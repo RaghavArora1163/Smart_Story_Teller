@@ -1,0 +1,8 @@
+flask
+flask-cors
+requests
+Pillow
+gTTS
+moviepy
+imageio-ffmpeg
+edge-tts
