@@ -37,12 +37,17 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
   double _progress = 0.0; // 0..1
   String _progressMsg = "Starting…";
 
+  // refresh ticker to keep custom controls/slider responsive on web
+  Timer? _progressTicker;
+
   bool get _hasSlides => _story?.slides.isNotEmpty == true;
 
   @override
   void dispose() {
     _prompt.dispose();
     _pollTimer?.cancel();
+    _progressTicker?.cancel();
+    _videoCtrl?.removeListener(_controllerListener);
     _videoCtrl?.dispose();
     super.dispose();
   }
@@ -64,6 +69,8 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
       _runId = null;
       _progress = 0;
       _progressMsg = "Starting…";
+      _progressTicker?.cancel();
+      _videoCtrl?.removeListener(_controllerListener);
       _videoCtrl?.dispose();
       _videoCtrl = null;
     });
@@ -90,7 +97,7 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
       await _waitForCompletion(runId);
       await _fetchResult(runId);
     } catch (e) {
-      setState(() => _error = e.toString());
+      if (mounted) setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() => _loading = false);
       _pollTimer?.cancel();
@@ -154,44 +161,81 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
 
       // init video player if available
       if (story.videoUrl != null && story.videoUrl!.isNotEmpty) {
+        // Clean up any old controller
+        _progressTicker?.cancel();
+        _videoCtrl?.removeListener(_controllerListener);
+        await _videoCtrl?.dispose();
+
         final ctrl = VideoPlayerController.networkUrl(
           Uri.parse('$kApiBase${story.videoUrl}'),
         );
+
         await ctrl.initialize();
         ctrl.setLooping(false);
+
+        // Try autoplay muted (required on web without explicit user gesture)
+        try {
+          await ctrl.setVolume(0.0);
+          await ctrl.play();
+        } catch (_) {
+          // Autoplay might still be blocked by the browser; controls allow manual play.
+        }
+
+        // Listen for end / state changes
+        ctrl.addListener(_controllerListener);
+
         if (!mounted) return;
         setState(() => _videoCtrl = ctrl);
+
+        // Kick a lightweight ticker to refresh custom controls (esp. on web)
+        _progressTicker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+          if (!mounted) return;
+          if (_videoCtrl == null) return;
+          // Repaint only while initialized; cheap setState is fine here
+          setState(() {});
+        });
       }
       break;
     }
   }
 
+  void _controllerListener() {
+    // Example: when video ends, keep UI in a clean state
+    final c = _videoCtrl;
+    if (c == null) return;
+    final v = c.value;
+    if (!v.isInitialized) return;
+    if (v.position >= v.duration && v.duration > Duration.zero) {
+      // reached end
+      c.pause();
+    }
+    // No direct setState here; the periodic ticker/ValueListenableBuilder will repaint.
+  }
+
   // Map API result → your model classes
   StoryResponse _storyFromJson(Map<String, dynamic> j) {
-  final slides = (j['slides'] as List<dynamic>).map((e) {
-    final m = e as Map<String, dynamic>;
-    return StorySlide(
-      index: (m['index'] as num).toInt(),
-      title: m['title'] as String? ?? '',
-      text: m['text'] as String? ?? '',
-      imageUrl: m['image_url'] as String? ?? '',
-      audioUrl: m['audio_url'] as String? ?? '',
+    final slides = (j['slides'] as List<dynamic>).map((e) {
+      final m = e as Map<String, dynamic>;
+      return StorySlide(
+        index: (m['index'] as num).toInt(),
+        title: m['title'] as String? ?? '',
+        text: m['text'] as String? ?? '',
+        imageUrl: m['image_url'] as String? ?? '',
+        audioUrl: m['audio_url'] as String? ?? '',
+      );
+    }).toList();
+
+    return StoryResponse(
+      runId: (j['run_id'] as String?) ?? '',
+      videoUrl: j['video_url'] as String?,
+      slides: slides,
     );
-  }).toList();
-
-  return StoryResponse(
-    // If your model expects non-nullable String, keep the `?? ''`.
-    // If you later switch to nullable in the model, you can remove the fallback.
-    runId: (j['run_id'] as String?) ?? '',
-    videoUrl: j['video_url'] as String?,
-    slides: slides,
-  );
-}
-
+  }
 
   // ---- Direct download (no new tab) via Blob ----
   Future<void> _downloadBinary(String url, String filename) async {
     if (!kIsWeb) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Download: $url')));
       return;
     }
@@ -349,7 +393,7 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
 
             const SizedBox(height: 20),
 
-            // Results (slides + video) – unchanged except for download button using Blob
+            // Results (slides + video)
             if (_story != null) ...[
               Align(
                 alignment: Alignment.centerLeft,
@@ -367,7 +411,7 @@ class _StoryMakerPageState extends State<StoryMakerPage> {
                             child: SlideCard(slide: s),
                           ))
                       .toList(),
-                  options:  CarouselOptions(
+                  options: CarouselOptions(
                     enlargeCenterPage: true,
                     enableInfiniteScroll: false,
                     viewportFraction: 0.82,
@@ -484,78 +528,84 @@ class _VideoControlsBelow extends StatefulWidget {
 
 class _VideoControlsBelowState extends State<_VideoControlsBelow> {
   String _fmt(Duration d) {
-    final mm = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final ss = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final total = d.inSeconds;
+    final mm = (total ~/ 60).toString().padLeft(2, '0');
+    final ss = (total % 60).toString().padLeft(2, '0');
     return '$mm:$ss';
   }
 
   @override
   Widget build(BuildContext context) {
     final c = widget.controller;
-    final pos = c.value.position;
-    final dur = c.value.duration;
     final primary = Theme.of(context).colorScheme.primary;
 
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF111827),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF374151)),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black54,
-            blurRadius: 10,
-            offset: Offset(0, 3),
-            spreadRadius: -6,
-          )
-        ],
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      child: Row(
-        children: [
-          IconButton(
-            color: primary,
-            onPressed: () async {
-              if (c.value.isPlaying) {
-                await c.pause();
-              } else {
-                await c.play();
-              }
-              if (mounted) setState(() {});
-            },
-            icon: Icon(
-              c.value.isPlaying ? Icons.pause_circle : Icons.play_circle,
-              size: 32,
-            ),
+    return ValueListenableBuilder<VideoPlayerValue>(
+      valueListenable: c,
+      builder: (_, v, __) {
+        final pos = v.position;
+        final dur = v.duration == Duration.zero ? const Duration(milliseconds: 1) : v.duration;
+
+        return Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFF111827),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF374151)),
+            boxShadow: const [
+              BoxShadow(
+                color: Colors.black54,
+                blurRadius: 10,
+                offset: Offset(0, 3),
+                spreadRadius: -6,
+              )
+            ],
           ),
-          Expanded(
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 4,
-                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
-                overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
-                activeTrackColor: primary,
-                inactiveTrackColor: Colors.white24,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            children: [
+              IconButton(
+                color: primary,
+                onPressed: () async {
+                  if (v.isPlaying) {
+                    await c.pause();
+                  } else {
+                    await c.play();
+                  }
+                },
+                icon: Icon(
+                  v.isPlaying ? Icons.pause_circle : Icons.play_circle,
+                  size: 32,
+                ),
               ),
-              child: Slider(
-                min: 0.0,
-                max: (dur.inMilliseconds > 0 ? dur.inMilliseconds.toDouble() : 1.0),
-                value: pos.inMilliseconds.clamp(0, dur.inMilliseconds).toDouble(),
-                onChanged: (v) async => c.seekTo(Duration(milliseconds: v.toInt())),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 4,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+                    overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+                    activeTrackColor: primary,
+                    inactiveTrackColor: Colors.white24,
+                  ),
+                  child: Slider(
+                    min: 0.0,
+                    max: dur.inMilliseconds.toDouble(),
+                    value: pos.inMilliseconds.clamp(0, dur.inMilliseconds).toDouble(),
+                    onChanged: (vms) async => c.seekTo(Duration(milliseconds: vms.toInt())),
+                  ),
+                ),
               ),
-            ),
+              Text(
+                '${_fmt(pos)} / ${_fmt(dur)}',
+                style: const TextStyle(color: Colors.white),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                onPressed: () => c.seekTo(Duration.zero),
+                icon: const Icon(Icons.replay, color: Colors.white),
+              ),
+            ],
           ),
-          Text(
-            '${_fmt(pos)} / ${_fmt(dur)}',
-            style: const TextStyle(color: Colors.white),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            onPressed: () => c.seekTo(Duration.zero),
-            icon: const Icon(Icons.replay, color: Colors.white),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }

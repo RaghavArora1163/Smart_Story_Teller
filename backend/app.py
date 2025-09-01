@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import os, uuid, asyncio, re
+import os, uuid, asyncio, re, mimetypes
 from urllib.parse import quote
 from threading import Thread, Lock
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, make_response
 from flask_cors import CORS
 import requests
 from PIL import Image
@@ -99,7 +99,6 @@ def _style_from_prompt(prompt: str):
 
 # ---------- Long, connected captions ----------
 def _paragraph_en(opening: str, motif: str, role: str, time_hint: str, vibe: str) -> str:
-    # role: opening/inciting/rising/midpoint/climax/resolution
     s1 = f"{opening.strip().capitalize()}."
     if role == "opening":
         s2 = f"In {time_hint}, the scene breathes; {motif} hangs quietly in the air while edges come into focus."
@@ -237,14 +236,26 @@ def tts_to_mp3(text, out_path, lang="en", user_voice=None):
 
 def build_video(slides, out_path):
     clips = []
-    for s in slides:
-        a = AudioFileClip(s["audio_path"])
-        v = ImageClip(s["image_path"]).set_duration(a.duration).set_audio(a)
-        clips.append(v)
-    video = concatenate_videoclips(clips, method="compose")
-    video.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac")
-    for c in clips:
-        try: c.close()
+    try:
+        for s in slides:
+            a = AudioFileClip(s["audio_path"])
+            v = ImageClip(s["image_path"]).set_duration(a.duration).set_audio(a)
+            clips.append(v)
+        video = concatenate_videoclips(clips, method="compose")
+        # Web friendly flags: faststart + yuv420p
+        video.write_videofile(
+            out_path,
+            fps=30,
+            codec="libx264",
+            audio_codec="aac",
+            ffmpeg_params=["-movflags", "+faststart", "-pix_fmt", "yuv420p"],
+        )
+    finally:
+        # Close all clips to free file handles
+        for c in clips:
+            try: c.close()
+            except: pass
+        try: video.close()  # type: ignore
         except: pass
 
 # ======================================================
@@ -438,13 +449,68 @@ def serve_image(run_id, filename):
 def serve_audio(run_id, filename):
     return send_from_directory(os.path.join(AUDIO_DIR, run_id), filename, as_attachment=False)
 
+def _iter_file_range(path, start, end, block_size=8192):
+    with open(path, 'rb') as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = f.read(min(block_size, remaining))
+            if not chunk:
+                break
+            yield chunk
+            remaining -= len(chunk)
+
 @app.route("/videos/<filename>")
 def serve_video(filename):
-    return send_from_directory(VIDEO_DIR, filename, as_attachment=False)
+    # Full path & size
+    path = os.path.join(VIDEO_DIR, filename)
+    if not os.path.isfile(path):
+        return jsonify({"error": "not found"}), 404
+
+    file_size = os.path.getsize(path)
+    range_header = request.headers.get('Range', None)
+
+    # Default content-type
+    ctype = mimetypes.guess_type(path)[0] or 'video/mp4'
+
+    if range_header:
+        # Parse Range: bytes=start-end
+        m = re.match(r"bytes=(\d*)-(\d*)", range_header)
+        if m:
+            start_s, end_s = m.groups()
+            try:
+                start = int(start_s) if start_s else 0
+            except ValueError:
+                start = 0
+            try:
+                end = int(end_s) if end_s else file_size - 1
+            except ValueError:
+                end = file_size - 1
+
+            start = max(0, start)
+            end = min(file_size - 1, end)
+            if start > end:
+                # Invalid range
+                resp = make_response('', 416)
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                return resp
+
+            length = (end - start) + 1
+            resp = Response(_iter_file_range(path, start, end), status=206, mimetype=ctype)
+            resp.headers.add('Content-Range', f'bytes {start}-{end}/{file_size}')
+            resp.headers.add('Accept-Ranges', 'bytes')
+            resp.headers.add('Content-Length', str(length))
+            return resp
+
+    # No Range: return whole file
+    resp = send_from_directory(VIDEO_DIR, filename, as_attachment=False, mimetype=ctype)
+    resp.headers["Accept-Ranges"] = "bytes"
+    return resp
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
+    # On some hosts (Render/Heroku), PORT is injected
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
